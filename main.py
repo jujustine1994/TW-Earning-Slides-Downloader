@@ -12,7 +12,10 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 # ---- 常數 ----
@@ -105,11 +108,20 @@ def fetch_company_list() -> dict[str, str]:
     """
     companies: dict[str, str] = {}
     fetch_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://mopsov.twse.com.tw/mops/web/t51sb01",
+        "Connection": "keep-alive",
     }
+    session = requests.Session()
+    # 先訪問主頁取得 session cookie
+    session.get("https://mopsov.twse.com.tw/mops/web/t51sb01",
+                headers=fetch_headers, timeout=30, verify=False)
+
     for market_code, _ in MARKET_CODES:
         url = MARKET_LIST_URLS[market_code]
-        resp = requests.get(url, headers=fetch_headers, timeout=30)
+        resp = session.get(url, headers=fetch_headers, timeout=30, verify=False)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         for row in soup.find_all("tr"):
@@ -117,7 +129,7 @@ def fetch_company_list() -> dict[str, str]:
             if not cells:
                 continue
             co_id = cells[0].get_text(strip=True)
-            # 公司代號：4-6 位數字或英數字，排除空值與中文標題列
+            # 公司代號：2-6 位英數字，排除空值與中文標題列
             if co_id and 2 <= len(co_id) <= 6 and co_id.isalnum():
                 companies[co_id] = market_code
     return companies
