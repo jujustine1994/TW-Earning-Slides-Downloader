@@ -101,37 +101,37 @@ def build_save_path(date_str: str, lang: str, output_dir: str) -> str:
 
 
 # ---- 公司清單快取 ----
-def fetch_company_list() -> dict[str, str]:
-    """
-    從 MOPS 抓取四個市場的公司清單，回傳 {公司代號: market_code} 字典。
-    失敗時拋出例外（由呼叫者顯示錯誤訊息）。
-    """
-    companies: dict[str, str] = {}
-    fetch_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": "https://mopsov.twse.com.tw/mops/web/t51sb01",
-        "Connection": "keep-alive",
-    }
-    session = requests.Session()
-    # 先訪問主頁取得 session cookie
-    session.get("https://mopsov.twse.com.tw/mops/web/t51sb01",
-                headers=fetch_headers, timeout=30, verify=False)
+_LIST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://mopsov.twse.com.tw/mops/web/t51sb01",
+    "Connection": "keep-alive",
+}
 
-    for market_code, _ in MARKET_CODES:
-        url = MARKET_LIST_URLS[market_code]
-        resp = session.get(url, headers=fetch_headers, timeout=30, verify=False)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for row in soup.find_all("tr"):
-            cells = row.find_all("td")
-            if not cells:
-                continue
-            co_id = cells[0].get_text(strip=True)
-            # 公司代號：2-6 位英數字，排除空值與中文標題列
-            if co_id and 2 <= len(co_id) <= 6 and co_id.isalnum():
-                companies[co_id] = market_code
+
+def _make_list_session() -> requests.Session:
+    """建立已取得 session cookie 的 requests.Session。"""
+    session = requests.Session()
+    session.get("https://mopsov.twse.com.tw/mops/web/t51sb01",
+                headers=_LIST_HEADERS, timeout=30, verify=False)
+    return session
+
+
+def _fetch_one_market(market_code: str, session: requests.Session) -> dict[str, str]:
+    """抓取單一市場的公司清單，回傳 {公司代號: market_code}。"""
+    companies: dict[str, str] = {}
+    url = MARKET_LIST_URLS[market_code]
+    resp = session.get(url, headers=_LIST_HEADERS, timeout=30, verify=False)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for row in soup.find_all("tr"):
+        cells = row.find_all("td")
+        if not cells:
+            continue
+        co_id = cells[0].get_text(strip=True)
+        if co_id and 2 <= len(co_id) <= 6 and co_id.isalnum():
+            companies[co_id] = market_code
     return companies
 
 
@@ -302,10 +302,18 @@ class EarningSlideApp:
         # 公司清單快取狀態
         cache_frame = ttk.Frame(frame_query)
         cache_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 2))
-        self.cache_label = ttk.Label(cache_frame, text="公司清單：載入中...", foreground="gray")
+        cache_frame.columnconfigure(0, weight=1)
+
+        info_row = ttk.Frame(cache_frame)
+        info_row.grid(row=0, column=0, sticky="ew")
+        self.cache_label = ttk.Label(info_row, text="公司清單：載入中...",
+                                     foreground="gray", wraplength=340, justify="left")
         self.cache_label.pack(side="left")
-        self.btn_update_cache = ttk.Button(cache_frame, text="立即更新", command=self._update_cache)
+        self.btn_update_cache = ttk.Button(info_row, text="立即更新", command=self._update_cache)
         self.btn_update_cache.pack(side="left", padx=(10, 0))
+
+        self.cache_progress = ttk.Progressbar(cache_frame, mode="determinate", length=340)
+        # 預設隱藏，更新時才顯示
 
         # 開始按鈕
         frame_btn = tk.Frame(self.root)
@@ -347,39 +355,53 @@ class EarningSlideApp:
         companies, updated_at = load_company_list()
         self._companies = companies
         if not updated_at:
-            self.cache_label.config(text="公司清單：尚未建立，建議點「立即更新」", foreground="orange")
+            self.cache_label.config(
+                text="公司清單：尚未建立，建議點「立即更新」",
+                foreground="#7B5C00"
+            )
         else:
             age = cache_age_days(updated_at)
             display_date = f"{updated_at[:4]}-{updated_at[4:6]}-{updated_at[6:]}"
             if age > CACHE_MAX_DAYS:
                 self.cache_label.config(
-                    text=f"公司清單：{display_date}（已 {age} 天，建議更新）",
-                    foreground="orange"
+                    text=f"公司清單：上次更新 {display_date}（已 {age} 天，建議更新）",
+                    foreground="#7B5C00"
                 )
             else:
                 self.cache_label.config(
-                    text=f"公司清單：{display_date}（{len(companies)} 家公司）",
+                    text=f"公司清單：上次更新 {display_date}（{len(companies)} 家公司）",
                     foreground="gray"
                 )
 
     def _update_cache(self):
-        """手動更新公司清單（背景執行）。"""
+        """手動更新公司清單（背景執行，逐市場回報進度）。"""
         if self.is_running:
             messagebox.showwarning("提示", "下載進行中，請完成後再更新。")
             return
         self.btn_update_cache.config(state="disabled")
-        self.cache_label.config(text="公司清單：更新中...", foreground="gray")
+        self.cache_label.config(text="公司清單：連線中...", foreground="gray")
+        self.cache_progress["maximum"] = len(MARKET_CODES)
+        self.cache_progress["value"] = 0
+        self.cache_progress.grid(row=1, column=0, sticky="ew", pady=(4, 0))
 
         def _worker():
             try:
-                companies = fetch_company_list()
+                session = _make_list_session()
+                companies: dict[str, str] = {}
+                for i, (market_code, market_name) in enumerate(MARKET_CODES):
+                    self.msg_queue.put(("cache_progress",
+                                        (i, f"更新中：{market_name}（{i}/{len(MARKET_CODES)}）")))
+                    result = _fetch_one_market(market_code, session)
+                    companies.update(result)
                 save_company_list(companies)
                 self._companies = companies
                 updated_at = date.today().strftime("%Y%m%d")
                 display_date = f"{updated_at[:4]}-{updated_at[4:6]}-{updated_at[6:]}"
-                self.msg_queue.put(("cache_ok", f"公司清單：{display_date}（{len(companies)} 家公司）"))
+                self.msg_queue.put(("cache_ok",
+                                    f"公司清單：上次更新 {display_date}（{len(companies)} 家公司）"))
             except Exception as e:
-                self.msg_queue.put(("cache_err", f"更新失敗：{e}"))
+                short_err = str(e)[:60]
+                self.msg_queue.put(("cache_err", f"更新失敗，請確認網路後重試"))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -555,11 +577,17 @@ class EarningSlideApp:
                     else:
                         self.progress_label.config(text="發生錯誤")
                         messagebox.showerror("錯誤", message)
+                elif msg_type == "cache_progress":
+                    current, label = data
+                    self.cache_progress["value"] = current
+                    self.cache_label.config(text=label, foreground="gray")
                 elif msg_type == "cache_ok":
+                    self.cache_progress.grid_remove()
                     self.cache_label.config(text=data, foreground="gray")
                     self.btn_update_cache.config(state="normal")
                 elif msg_type == "cache_err":
-                    self.cache_label.config(text=data, foreground="red")
+                    self.cache_progress.grid_remove()
+                    self.cache_label.config(text=data, foreground="#C0392B")
                     self.btn_update_cache.config(state="normal")
         except queue.Empty:
             pass
