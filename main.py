@@ -6,7 +6,9 @@ TW Earning Slides Downloader — 法說會簡報批次下載工具
 import os
 import json
 import queue
+import random
 import threading
+import time
 from datetime import date, datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -20,7 +22,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ---- 常數 ----
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MOPS_URL = "https://mopsov.twse.com.tw/mops/web/t100sb02_1"
+MOPS_BASE = "https://mopsov.twse.com.tw"
+MOPS_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t100sb02_1"
+MOPS_MAIN_URL = "https://mopsov.twse.com.tw/mops/web/t100sb02_1"
 COMPANY_MARKET_FILE = os.path.join(SCRIPT_DIR, "company_market.json")
 CACHE_MAX_DAYS = 90  # 超過 90 天自動提示更新
 
@@ -73,11 +77,16 @@ def parse_roc_date(roc_date_str: str) -> str:
     將民國日期字串轉為西元 YYYYMMDD。
     例：'115/01/15' → '20260115'
     '114/3/5' → '20250305'
+    '115/03/03 ~ 115/03/06' → '20260303'（取第一個日期）
     """
-    parts = roc_date_str.strip().split("/")
+    first = roc_date_str.strip().split("~")[0].strip()
+    parts = first.split("/")
     if len(parts) != 3:
         return ""
-    roc_y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+    try:
+        roc_y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+    except ValueError:
+        return ""
     western_y = roc_y + 1911
     return f"{western_y}{m:02d}{d:02d}"
 
@@ -177,23 +186,27 @@ def lookup_market(co_id: str, companies: dict[str, str]) -> str | None:
 # ---- MOPS 查詢 ----
 def query_mops(market: str, year: int, month: int, co_id: str) -> list[dict]:
     """
-    POST 到 MOPS 查詢單一月份的法說會記錄。
+    從 MOPS 查詢指定年月的法說會記錄。
     回傳 list of {date: str (YYYYMMDD), zh_url: str, en_url: str}。
     表格為空或無符合列時回傳 []。
+
+    注意：MOPS AJAX API 一次回傳該公司全部記錄（不按年月過濾），
+    本函式在 client 端依 year/month 篩選後回傳。
     """
     data = {
         "market": market,
-        "year": str(roc_year(year)),
-        "month": str(month),
         "co_id": co_id,
+        "firstin": "1",
     }
     try:
-        resp = requests.post(MOPS_URL, data=data, headers=HEADERS, timeout=15)
+        session = requests.Session()
+        session.get(MOPS_MAIN_URL, headers=HEADERS, timeout=15, verify=False)
+        resp = session.post(MOPS_URL, data=data, headers=HEADERS, timeout=15, verify=False)
         resp.raise_for_status()
     except requests.exceptions.RequestException:
         return []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(resp.content, "html.parser")
     rows = soup.find_all("tr")
     results = []
 
@@ -210,11 +223,17 @@ def query_mops(market: str, year: int, month: int, co_id: str) -> list[dict]:
         if not date_str:
             continue
 
-        # 中文檔案：column 6；英文檔案：column 7
+        # 依 year/month 篩選
+        if int(date_str[:4]) != year or int(date_str[4:6]) != month:
+            continue
+
+        # 中文檔案：column 6；英文檔案：column 7（相對路徑補上 base URL）
         zh_link = cells[6].find("a")
         en_link = cells[7].find("a")
-        zh_url = zh_link["href"] if zh_link and zh_link.get("href") else ""
-        en_url = en_link["href"] if en_link and en_link.get("href") else ""
+        zh_href = zh_link.get("href", "") if zh_link else ""
+        en_href = en_link.get("href", "") if en_link else ""
+        zh_url = (MOPS_BASE + zh_href) if zh_href.startswith("/") else zh_href
+        en_url = (MOPS_BASE + en_href) if en_href.startswith("/") else en_href
 
         results.append({"date": date_str, "zh_url": zh_url, "en_url": en_url})
 
@@ -248,7 +267,7 @@ def download_pdf(url: str, save_path: str) -> None:
     下載 PDF 到指定路徑。
     失敗時拋出 requests.exceptions.RequestException（由呼叫者處理）。
     """
-    response = requests.get(url, stream=True, headers=HEADERS, timeout=30)
+    response = requests.get(url, stream=True, headers=HEADERS, timeout=30, verify=False)
     response.raise_for_status()
     with open(save_path, "wb") as f:
         for chunk in response.iter_content(chunk_size=8192):
@@ -285,11 +304,23 @@ class EarningSlideApp:
         ttk.Label(frame_query, text="日期範圍：").grid(row=1, column=0, sticky="w", pady=4)
         date_frame = ttk.Frame(frame_query)
         date_frame.grid(row=1, column=1, sticky="w", pady=4)
-        self.start_var = tk.StringVar(value="20150101")
-        self.end_var = tk.StringVar(value="20260325")
-        ttk.Entry(date_frame, textvariable=self.start_var, width=12).pack(side="left")
+        self.start_var = tk.StringVar()
+        self.end_var = tk.StringVar()
+        PLACEHOLDER = "YYYYMMDD"
+        self._start_entry = ttk.Entry(date_frame, textvariable=self.start_var, width=12,
+                                      foreground="grey")
+        self._start_entry.pack(side="left")
         ttk.Label(date_frame, text="  ~  ").pack(side="left")
-        ttk.Entry(date_frame, textvariable=self.end_var, width=12).pack(side="left")
+        self._end_entry = ttk.Entry(date_frame, textvariable=self.end_var, width=12,
+                                    foreground="grey")
+        self._end_entry.pack(side="left")
+
+        # 設定 placeholder
+        for entry, var in ((self._start_entry, self.start_var),
+                           (self._end_entry, self.end_var)):
+            var.set(PLACEHOLDER)
+            entry.bind("<FocusIn>",  lambda e, en=entry, v=var: self._ph_focus_in(en, v, PLACEHOLDER))
+            entry.bind("<FocusOut>", lambda e, en=entry, v=var: self._ph_focus_out(en, v, PLACEHOLDER))
 
         ttk.Label(frame_query, text="儲存資料夾：").grid(row=2, column=0, sticky="w", pady=4)
         folder_frame = ttk.Frame(frame_query)
@@ -315,11 +346,22 @@ class EarningSlideApp:
         self.cache_progress = ttk.Progressbar(cache_frame, mode="determinate", length=340)
         # 預設隱藏，更新時才顯示
 
-        # 開始按鈕
+        # 延遲查詢選項
+        self.delay_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame_query,
+            text="防爬蟲延遲（每次查詢間隔 1~3 秒）",
+            variable=self.delay_var,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 2))
+
+        # 開始按鈕 + 說明按鈕
         frame_btn = tk.Frame(self.root)
         frame_btn.grid(row=1, column=0, pady=8)
         self.btn_start = ttk.Button(frame_btn, text="▶  開始下載", command=self._start, width=20)
-        self.btn_start.pack(ipady=6)
+        self.btn_start.pack(side="left", ipady=6, padx=(0, 8))
+        ttk.Button(frame_btn, text="？  說明", command=self._show_help, width=10).pack(
+            side="left", ipady=6
+        )
 
         # 處理進度
         frame_progress = ttk.LabelFrame(self.root, text=" 處理進度 ", padding=8)
@@ -405,6 +447,76 @@ class EarningSlideApp:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    # ---- 說明視窗 ----
+    def _show_help(self):
+        win = tk.Toplevel(self.root)
+        win.title("使用說明")
+        win.resizable(False, False)
+        win.grab_set()
+
+        frame = ttk.Frame(win, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        txt = tk.Text(frame, width=56, height=26, font=("", 9),
+                      relief="flat", wrap="word", state="normal",
+                      cursor="arrow", bg=win.cget("bg"))
+        txt.pack(anchor="w")
+
+        # tag 定義
+        txt.tag_config("heading",  foreground="#1155AA", font=("", 9, "bold"))
+        txt.tag_config("url",      foreground="#0066CC", font=("Consolas", 9))
+        txt.tag_config("code",     foreground="#2E7D32", font=("Consolas", 9))
+        txt.tag_config("emphasis", foreground="#C75000", font=("", 9, "bold"))
+
+        def h(text):   txt.insert("end", text, "heading")
+        def u(text):   txt.insert("end", text, "url")
+        def c(text):   txt.insert("end", text, "code")
+        def em(text):  txt.insert("end", text, "emphasis")
+        def t(text):   txt.insert("end", text)
+
+        h("【功能說明】\n")
+        t("從公開資訊觀測站（MOPS）批次下載法人說明會簡報 PDF。\n"
+          "輸入公司代號與日期範圍後，工具會自動判斷市場別\n"
+          "（上市／上櫃／興櫃／公開發行），逐月掃描並下載所有符合的簡報。\n\n")
+
+        h("【操作步驟】\n")
+        t("1. 輸入公司代號（例："); em("2330"); t("）\n")
+        t("2. 輸入日期範圍（格式："); em("YYYYMMDD"); t("，例：20150101 ~ 20260325）\n")
+        t("3. 選擇儲存資料夾\n")
+        t("4. 按「"); em("▶ 開始下載"); t("」\n\n")
+
+        h("【檔案命名規則】\n")
+        c("  20260115_zh.pdf   "); t("← 中文版（優先下載）\n")
+        c("  20260115_en.pdf   "); t("← 英文版（無中文版時）\n")
+        c("  20260115_zh_2.pdf "); t("← 同日第 2 場\n\n")
+
+        h("【資料來源】\n")
+        t("法說會查詢頁面：\n  "); u("https://mopsov.twse.com.tw/mops/web/t100sb02_1\n")
+        t("PDF 下載路徑：\n  "); u("https://mopsov.twse.com.tw/nas/STR/<檔名>.pdf\n\n")
+
+        h("【防爬蟲延遲】\n")
+        t("若 MOPS 擋下請求導致查無資料，可勾選「"); em("防爬蟲延遲"); t("」，\n")
+        t("每次查詢之間會隨機等待 "); em("1~3 秒"); t("。")
+
+        txt.config(state="disabled")
+        ttk.Button(frame, text="關閉", command=win.destroy, width=10).pack(pady=(12, 0))
+
+    # ---- Placeholder 工具 ----
+    def _ph_focus_in(self, entry: ttk.Entry, var: tk.StringVar, placeholder: str):
+        if var.get() == placeholder:
+            var.set("")
+            entry.configure(foreground="black")
+
+    def _ph_focus_out(self, entry: ttk.Entry, var: tk.StringVar, placeholder: str):
+        if not var.get().strip():
+            var.set(placeholder)
+            entry.configure(foreground="grey")
+
+    def _get_date_value(self, var: tk.StringVar) -> str:
+        """取得日期值，若為 placeholder 則回傳空字串。"""
+        v = var.get().strip()
+        return "" if v == "YYYYMMDD" else v
+
     # ---- UI 互動 ----
     def _select_folder(self):
         path = filedialog.askdirectory(title="選擇儲存資料夾")
@@ -418,8 +530,8 @@ class EarningSlideApp:
     # ---- 驗證輸入 ----
     def _validate_inputs(self) -> bool:
         co_id = self.co_id_var.get().strip()
-        start = self.start_var.get().strip()
-        end = self.end_var.get().strip()
+        start = self._get_date_value(self.start_var)
+        end = self._get_date_value(self.end_var)
         folder = self.folder_var.get().strip()
 
         if not co_id:
@@ -448,8 +560,8 @@ class EarningSlideApp:
             return
 
         co_id = self.co_id_var.get().strip()
-        start = self.start_var.get().strip()
-        end = self.end_var.get().strip()
+        start = self._get_date_value(self.start_var)
+        end = self._get_date_value(self.end_var)
         folder = self.folder_var.get().strip()
 
         # 重置 UI
@@ -495,9 +607,12 @@ class EarningSlideApp:
             self.msg_queue.put(("progress_mode", "determinate"))
             self._set_progress(0, total, f"掃描中 0 / {total} 個月")
 
+            use_delay = self.delay_var.get()
             downloaded = 0
             for i, (year, month) in enumerate(months):
                 label = f"{year}/{month}"
+                if use_delay and i > 0:
+                    time.sleep(random.uniform(1, 3))
                 records = query_mops(market, year, month, co_id)
 
                 if not records:

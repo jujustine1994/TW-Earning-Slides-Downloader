@@ -21,8 +21,8 @@ MOCK_HTML_ONE_ROW = """
   <td>14:00</td>
   <td>台北文華東方酒店</td>
   <td>說明會摘要</td>
-  <td><a href="https://mopsov.twse.com.tw/server-java/FileDownLoad?fname=233020260115M001.pdf">233020260115M001.pdf</a></td>
-  <td><a href="https://mopsov.twse.com.tw/server-java/FileDownLoad?fname=233020260115E001.pdf">233020260115E001.pdf</a></td>
+  <td><a href="/nas/STR/233020260115M001.pdf">233020260115M001.pdf</a></td>
+  <td><a href="/nas/STR/233020260115E001.pdf">233020260115E001.pdf</a></td>
 </tr>
 </table></body></html>
 """
@@ -118,13 +118,20 @@ class TestBuildSavePath(unittest.TestCase):
 
 
 # ---- TestQueryMops ----
+def _make_mock_session(html_str: str):
+    """Helper：建立 mock Session，讓 session.post() 回傳指定 HTML。"""
+    mock_session = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.content = html_str.encode("utf-8")
+    mock_resp.raise_for_status = MagicMock()
+    mock_session.post.return_value = mock_resp
+    return mock_session
+
+
 class TestQueryMops(unittest.TestCase):
-    @patch("main.requests.post")
-    def test_one_row_with_both_links(self, mock_post):
-        mock_resp = MagicMock()
-        mock_resp.text = MOCK_HTML_ONE_ROW
-        mock_resp.raise_for_status = MagicMock()
-        mock_post.return_value = mock_resp
+    @patch("main.requests.Session")
+    def test_one_row_with_both_links(self, MockSession):
+        MockSession.return_value = _make_mock_session(MOCK_HTML_ONE_ROW)
 
         results = main.query_mops("sii", 2026, 1, "2330")
         self.assertEqual(len(results), 1)
@@ -132,22 +139,16 @@ class TestQueryMops(unittest.TestCase):
         self.assertIn("233020260115M001.pdf", results[0]["zh_url"])
         self.assertIn("233020260115E001.pdf", results[0]["en_url"])
 
-    @patch("main.requests.post")
-    def test_empty_table_returns_empty_list(self, mock_post):
-        mock_resp = MagicMock()
-        mock_resp.text = MOCK_HTML_EMPTY
-        mock_resp.raise_for_status = MagicMock()
-        mock_post.return_value = mock_resp
+    @patch("main.requests.Session")
+    def test_empty_table_returns_empty_list(self, MockSession):
+        MockSession.return_value = _make_mock_session(MOCK_HTML_EMPTY)
 
         results = main.query_mops("sii", 2026, 1, "2330")
         self.assertEqual(results, [])
 
-    @patch("main.requests.post")
-    def test_row_with_no_pdf_links(self, mock_post):
-        mock_resp = MagicMock()
-        mock_resp.text = MOCK_HTML_NO_PDF
-        mock_resp.raise_for_status = MagicMock()
-        mock_post.return_value = mock_resp
+    @patch("main.requests.Session")
+    def test_row_with_no_pdf_links(self, MockSession):
+        MockSession.return_value = _make_mock_session(MOCK_HTML_NO_PDF)
 
         results = main.query_mops("sii", 2026, 2, "2330")
         self.assertEqual(len(results), 1)
