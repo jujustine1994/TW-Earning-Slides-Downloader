@@ -4,8 +4,10 @@ TW Earning Slides Downloader — 法說會簡報批次下載工具
 """
 
 import os
+import json
 import queue
 import threading
+from datetime import date, datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
@@ -14,7 +16,11 @@ from bs4 import BeautifulSoup
 
 
 # ---- 常數 ----
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MOPS_URL = "https://mopsov.twse.com.tw/mops/web/t100sb02_1"
+COMPANY_MARKET_FILE = os.path.join(SCRIPT_DIR, "company_market.json")
+CACHE_MAX_DAYS = 90  # 超過 90 天自動提示更新
+
 HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -25,6 +31,14 @@ MARKET_CODES = [
     ("rotc", "興櫃"),
     ("pub",  "公開發行"),
 ]
+
+# 公司清單抓取 URL（靜態參數，從 MOPS t51sb01 頁面取得）
+MARKET_LIST_URLS = {
+    "sii":  "https://mopsov.twse.com.tw/mops/web/ajax_t51sb01?parameters=32b138d25ee38c00fbf70ec5a53724971d1df89c34d9a0ef54fddd0eca765118e1d5d55f2907af83df59ae82756caca30645f4a87baa01551cc98a6ff0816cbaad9c5c8c6df699b1ac8bf50f27c999868a65d5f5dd71b407c4d61b426833ab8c",
+    "otc":  "https://mopsov.twse.com.tw/mops/web/ajax_t51sb01?parameters=32b138d25ee38c00fbf70ec5a53724971d1df89c34d9a0ef54fddd0eca7651189431092059e57ec5acce2508557bbb820645f4a87baa01551cc98a6ff0816cbaad9c5c8c6df699b1ac8bf50f27c999868a65d5f5dd71b407c4d61b426833ab8c",
+    "rotc": "https://mopsov.twse.com.tw/mops/web/ajax_t51sb01?parameters=32b138d25ee38c00fbf70ec5a53724971d1df89c34d9a0ef54fddd0eca765118150b1250f6b0d18c5da95b58aafad725152f445b9d55dd4c51df9e26ea7918af4de96261009bdfefb47812fc6ed9b9145701ed44236616fb09e84fed0c84caa6",
+    "pub":  "https://mopsov.twse.com.tw/mops/web/ajax_t51sb01?parameters=32b138d25ee38c00fbf70ec5a53724971d1df89c34d9a0ef54fddd0eca765118f332b2e68ee1973efdd894533684e6040645f4a87baa01551cc98a6ff0816cbaad9c5c8c6df699b1ac8bf50f27c999868a65d5f5dd71b407c4d61b426833ab8c",
+}
 
 
 # ---- 日期工具 ----
@@ -83,6 +97,71 @@ def build_save_path(date_str: str, lang: str, output_dir: str) -> str:
         counter += 1
 
 
+# ---- 公司清單快取 ----
+def fetch_company_list() -> dict[str, str]:
+    """
+    從 MOPS 抓取四個市場的公司清單，回傳 {公司代號: market_code} 字典。
+    失敗時拋出例外（由呼叫者顯示錯誤訊息）。
+    """
+    companies: dict[str, str] = {}
+    fetch_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+    for market_code, _ in MARKET_CODES:
+        url = MARKET_LIST_URLS[market_code]
+        resp = requests.get(url, headers=fetch_headers, timeout=30)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for row in soup.find_all("tr"):
+            cells = row.find_all("td")
+            if not cells:
+                continue
+            co_id = cells[0].get_text(strip=True)
+            # 公司代號：4-6 位數字或英數字，排除空值與中文標題列
+            if co_id and 2 <= len(co_id) <= 6 and co_id.isalnum():
+                companies[co_id] = market_code
+    return companies
+
+
+def save_company_list(companies: dict[str, str]) -> None:
+    """將公司清單與更新日期存入 company_market.json。"""
+    data = {
+        "updated_at": date.today().strftime("%Y%m%d"),
+        "companies": companies,
+    }
+    with open(COMPANY_MARKET_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def load_company_list() -> tuple[dict[str, str], str]:
+    """
+    載入本地快取。
+    回傳 (companies dict, updated_at str)。
+    快取不存在時回傳 ({}, "")。
+    """
+    if not os.path.exists(COMPANY_MARKET_FILE):
+        return {}, ""
+    with open(COMPANY_MARKET_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get("companies", {}), data.get("updated_at", "")
+
+
+def cache_age_days(updated_at: str) -> int:
+    """回傳快取距今天數；updated_at 為空或格式錯誤時回傳 999。"""
+    if not updated_at:
+        return 999
+    try:
+        updated = datetime.strptime(updated_at, "%Y%m%d").date()
+        return (date.today() - updated).days
+    except ValueError:
+        return 999
+
+
+def lookup_market(co_id: str, companies: dict[str, str]) -> str | None:
+    """從快取查公司市場別，找不到回傳 None。"""
+    return companies.get(co_id)
+
+
 # ---- MOPS 查詢 ----
 def query_mops(market: str, year: int, month: int, co_id: str) -> list[dict]:
     """
@@ -130,12 +209,20 @@ def query_mops(market: str, year: int, month: int, co_id: str) -> list[dict]:
     return results
 
 
-def detect_market(co_id: str, months: list[tuple[int, int]]) -> str | None:
+def detect_market(co_id: str, months: list[tuple[int, int]], companies: dict[str, str] | None = None) -> str | None:
     """
-    從月份清單的末尾往前掃，找到第一個有資料的市場別並回傳其代碼。
-    偵測階段靜默跳過無資料的月份（不寫 log）。
+    市場別偵測：
+    1. 若有快取（companies 不為空），直接查快取。
+    2. 找不到或無快取時，fallback：逐月試誤。
     找不到回傳 None。
     """
+    # 優先查快取
+    if companies:
+        result = lookup_market(co_id, companies)
+        if result:
+            return result
+
+    # Fallback：試誤（從末尾往前掃，靜默跳過無資料月份）
     for year, month in reversed(months):
         for market_code, _ in MARKET_CODES:
             if query_mops(market_code, year, month, co_id):
@@ -165,8 +252,10 @@ class EarningSlideApp:
 
         self.msg_queue: queue.Queue = queue.Queue()
         self.is_running = False
+        self._companies: dict[str, str] = {}
 
         self._build_ui()
+        self._load_cache_on_startup()
         self._poll_queue()
 
     def _build_ui(self):
@@ -197,6 +286,14 @@ class EarningSlideApp:
         self.folder_var = tk.StringVar()
         ttk.Entry(folder_frame, textvariable=self.folder_var, state="readonly").grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ttk.Button(folder_frame, text="選擇", command=self._select_folder).grid(row=0, column=1)
+
+        # 公司清單快取狀態
+        cache_frame = ttk.Frame(frame_query)
+        cache_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 2))
+        self.cache_label = ttk.Label(cache_frame, text="公司清單：載入中...", foreground="gray")
+        self.cache_label.pack(side="left")
+        self.btn_update_cache = ttk.Button(cache_frame, text="立即更新", command=self._update_cache)
+        self.btn_update_cache.pack(side="left", padx=(10, 0))
 
         # 開始按鈕
         frame_btn = tk.Frame(self.root)
@@ -231,6 +328,48 @@ class EarningSlideApp:
         self.log_text.config(state="normal")
         self.log_text.insert("1.0", "輸入公司代號與日期範圍，按「開始下載」。\n")
         self.log_text.config(state="disabled")
+
+    # ---- 快取管理 ----
+    def _load_cache_on_startup(self):
+        """啟動時載入快取，若超過 90 天顯示警告（不自動更新，避免啟動卡頓）。"""
+        companies, updated_at = load_company_list()
+        self._companies = companies
+        if not updated_at:
+            self.cache_label.config(text="公司清單：尚未建立，建議點「立即更新」", foreground="orange")
+        else:
+            age = cache_age_days(updated_at)
+            display_date = f"{updated_at[:4]}-{updated_at[4:6]}-{updated_at[6:]}"
+            if age > CACHE_MAX_DAYS:
+                self.cache_label.config(
+                    text=f"公司清單：{display_date}（已 {age} 天，建議更新）",
+                    foreground="orange"
+                )
+            else:
+                self.cache_label.config(
+                    text=f"公司清單：{display_date}（{len(companies)} 家公司）",
+                    foreground="gray"
+                )
+
+    def _update_cache(self):
+        """手動更新公司清單（背景執行）。"""
+        if self.is_running:
+            messagebox.showwarning("提示", "下載進行中，請完成後再更新。")
+            return
+        self.btn_update_cache.config(state="disabled")
+        self.cache_label.config(text="公司清單：更新中...", foreground="gray")
+
+        def _worker():
+            try:
+                companies = fetch_company_list()
+                save_company_list(companies)
+                self._companies = companies
+                updated_at = date.today().strftime("%Y%m%d")
+                display_date = f"{updated_at[:4]}-{updated_at[4:6]}-{updated_at[6:]}"
+                self.msg_queue.put(("cache_ok", f"公司清單：{display_date}（{len(companies)} 家公司）"))
+            except Exception as e:
+                self.msg_queue.put(("cache_err", f"更新失敗：{e}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ---- UI 互動 ----
     def _select_folder(self):
@@ -294,20 +433,23 @@ class EarningSlideApp:
 
         t = threading.Thread(
             target=self._worker,
-            args=(co_id, start, end, folder),
+            args=(co_id, start, end, folder, self._companies),
             daemon=True,
         )
         t.start()
 
-    def _worker(self, co_id: str, start: str, end: str, output_dir: str):
+    def _worker(self, co_id: str, start: str, end: str, output_dir: str, companies: dict):
         """背景執行緒：偵測市場別 → 逐月掃描 → 下載"""
         try:
             months = date_range_to_months(start, end)
             total = len(months)
 
-            # 偵測市場別
-            self._log("[INFO] 偵測市場別中...")
-            market = detect_market(co_id, months)
+            # 偵測市場別（快取優先）
+            if companies:
+                self._log("[INFO] 查詢公司清單快取...")
+            else:
+                self._log("[INFO] 無快取，以試誤方式偵測市場別...")
+            market = detect_market(co_id, months, companies)
             if market is None:
                 self._done(False, output_dir, "查無此公司的法說會記錄，請確認公司代號是否正確。")
                 return
@@ -401,6 +543,12 @@ class EarningSlideApp:
                     else:
                         self.progress_label.config(text="發生錯誤")
                         messagebox.showerror("錯誤", message)
+                elif msg_type == "cache_ok":
+                    self.cache_label.config(text=data, foreground="gray")
+                    self.btn_update_cache.config(state="normal")
+                elif msg_type == "cache_err":
+                    self.cache_label.config(text=data, foreground="red")
+                    self.btn_update_cache.config(state="normal")
         except queue.Empty:
             pass
         self.root.after(100, self._poll_queue)
